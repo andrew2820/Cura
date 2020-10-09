@@ -1,12 +1,15 @@
 # Copyright (c) 2015 Ultimaker B.V.
 # Uranium is released under the terms of the LGPLv3 or higher.
+from typing import Optional
 
 from UM.Mesh.MeshWriter import MeshWriter
 from UM.Math.Vector import Vector
 from UM.Logger import Logger
 from UM.Math.Matrix import Matrix
 from UM.Application import Application
-import UM.Scene.SceneNode
+from UM.Scene.SceneNode import SceneNode
+
+from cura.CuraApplication import CuraApplication
 
 import Savitar
 
@@ -23,6 +26,9 @@ except ImportError:
 import zipfile
 import UM.Application
 
+from UM.i18n import i18nCatalog
+catalog = i18nCatalog("cura")
+
 
 class ThreeMFWriter(MeshWriter):
     def __init__(self):
@@ -35,7 +41,7 @@ class ThreeMFWriter(MeshWriter):
         }
 
         self._unit_matrix_string = self._convertMatrixToString(Matrix())
-        self._archive = None
+        self._archive = None  # type: Optional[zipfile.ZipFile]
         self._store_archive = False
 
     def _convertMatrixToString(self, matrix):
@@ -54,19 +60,28 @@ class ThreeMFWriter(MeshWriter):
         result += str(matrix._data[2, 3])
         return result
 
-    ##  Should we store the archive
-    #   Note that if this is true, the archive will not be closed.
-    #   The object that set this parameter is then responsible for closing it correctly!
     def setStoreArchive(self, store_archive):
+        """Should we store the archive
+
+        Note that if this is true, the archive will not be closed.
+        The object that set this parameter is then responsible for closing it correctly!
+        """
         self._store_archive = store_archive
 
-    ##  Convenience function that converts an Uranium SceneNode object to a SavitarSceneNode
-    #   \returns Uranium Scenen node.
     def _convertUMNodeToSavitarNode(self, um_node, transformation = Matrix()):
-        if type(um_node) is not UM.Scene.SceneNode.SceneNode:
+        """Convenience function that converts an Uranium SceneNode object to a SavitarSceneNode
+
+        :returns: Uranium Scene node.
+        """
+        if not isinstance(um_node, SceneNode):
             return None
 
+        active_build_plate_nr = CuraApplication.getInstance().getMultiBuildPlateModel().activeBuildPlate
+        if um_node.callDecoration("getBuildPlateNumber") != active_build_plate_nr:
+            return
+
         savitar_node = Savitar.SceneNode()
+        savitar_node.setName(um_node.getName())
 
         node_matrix = um_node.getLocalTransformation()
 
@@ -85,9 +100,9 @@ class ThreeMFWriter(MeshWriter):
         # Handle per object settings (if any)
         stack = um_node.callDecoration("getStack")
         if stack is not None:
-            changed_setting_keys = set(stack.getTop().getAllKeys())
+            changed_setting_keys = stack.getTop().getAllKeys()
 
-            # Ensure that we save the extruder used for this object.
+            # Ensure that we save the extruder used for this object in a multi-extrusion setup
             if stack.getProperty("machine_extruder_count", "value") > 1:
                 changed_setting_keys.add("extruder_nr")
 
@@ -96,6 +111,9 @@ class ThreeMFWriter(MeshWriter):
                 savitar_node.setSetting(key, str(stack.getProperty(key, "value")))
 
         for child_node in um_node.getChildren():
+            # only save the nodes on the active build plate
+            if child_node.callDecoration("getBuildPlateNumber") != active_build_plate_nr:
+                continue
             savitar_child_node = self._convertUMNodeToSavitarNode(child_node)
             if savitar_child_node is not None:
                 savitar_node.addChild(savitar_child_node)
@@ -164,6 +182,7 @@ class ThreeMFWriter(MeshWriter):
             archive.writestr(relations_file, b'<?xml version="1.0" encoding="UTF-8"?> \n' + ET.tostring(relations_element))
         except Exception as e:
             Logger.logException("e", "Error writing zip file")
+            self.setInformation(catalog.i18nc("@error:zip", "Error writing 3mf file."))
             return False
         finally:
             if not self._store_archive:

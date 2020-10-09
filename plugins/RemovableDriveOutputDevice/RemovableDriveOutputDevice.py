@@ -1,4 +1,4 @@
-# Copyright (c) 2016 Ultimaker B.V.
+# Copyright (c) 2018 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
 import os.path
@@ -7,7 +7,7 @@ from UM.Application import Application
 from UM.Logger import Logger
 from UM.Message import Message
 from UM.FileHandler.WriteFileJob import WriteFileJob
-from UM.Mesh.MeshWriter import MeshWriter
+from UM.FileHandler.FileWriter import FileWriter #To check against the write modes (text vs. binary).
 from UM.Scene.Iterator.BreadthFirstIterator import BreadthFirstIterator
 from UM.OutputDevice.OutputDevice import OutputDevice
 from UM.OutputDevice import OutputDeviceError
@@ -28,18 +28,20 @@ class RemovableDriveOutputDevice(OutputDevice):
         self._writing = False
         self._stream = None
 
-    ##  Request the specified nodes to be written to the removable drive.
-    #
-    #   \param nodes A collection of scene nodes that should be written to the
-    #   removable drive.
-    #   \param file_name \type{string} A suggestion for the file name to write
-    #   to. If none is provided, a file name will be made from the names of the
-    #   meshes.
-    #   \param limit_mimetypes Should we limit the available MIME types to the
-    #   MIME types available to the currently active machine?
-    #
     def requestWrite(self, nodes, file_name = None, filter_by_machine = False, file_handler = None, **kwargs):
-        filter_by_machine = True # This plugin is indended to be used by machine (regardless of what it was told to do)
+        """Request the specified nodes to be written to the removable drive.
+
+        :param nodes: A collection of scene nodes that should be written to the
+            removable drive.
+        :param file_name: :type{string} A suggestion for the file name to write to.
+            If none is provided, a file name will be made from the names of the
+        meshes.
+        :param limit_mimetypes: Should we limit the available MIME types to the
+        MIME types available to the currently active machine?
+
+        """
+
+        filter_by_machine = True # This plugin is intended to be used by machine (regardless of what it was told to do)
         if self._writing:
             raise OutputDeviceError.DeviceBusyError()
 
@@ -56,32 +58,37 @@ class RemovableDriveOutputDevice(OutputDevice):
             machine_file_formats = [file_type.strip() for file_type in container.getMetaDataEntry("file_formats").split(";")]
 
             # Take the intersection between file_formats and machine_file_formats.
-            file_formats = list(filter(lambda file_format: file_format["mime_type"] in machine_file_formats, file_formats))
+            format_by_mimetype = {format["mime_type"]: format for format in file_formats}
+            file_formats = [format_by_mimetype[mimetype] for mimetype in machine_file_formats] #Keep them ordered according to the preference in machine_file_formats.
 
         if len(file_formats) == 0:
             Logger.log("e", "There are no file formats available to write with!")
-            raise OutputDeviceError.WriteRequestFailedError(catalog.i18nc("There are no file formats available to write with!"))
+            raise OutputDeviceError.WriteRequestFailedError(catalog.i18nc("@info:status", "There are no file formats available to write with!"))
+        preferred_format = file_formats[0]
 
         # Just take the first file format available.
         if file_handler is not None:
-            writer = file_handler.getWriterByMimeType(file_formats[0]["mime_type"])
+            writer = file_handler.getWriterByMimeType(preferred_format["mime_type"])
         else:
-            writer = Application.getInstance().getMeshFileHandler().getWriterByMimeType(file_formats[0]["mime_type"])
+            writer = Application.getInstance().getMeshFileHandler().getWriterByMimeType(preferred_format["mime_type"])
 
-        extension = file_formats[0]["extension"]
+        extension = preferred_format["extension"]
 
         if file_name is None:
             file_name = self._automaticFileName(nodes)
 
         if extension:  # Not empty string.
             extension = "." + extension
-        file_name = os.path.join(self.getId(), os.path.splitext(file_name)[0] + extension)
+        file_name = os.path.join(self.getId(), file_name + extension)
 
         try:
             Logger.log("d", "Writing to %s", file_name)
             # Using buffering greatly reduces the write time for many lines of gcode
-            self._stream = open(file_name, "wt", buffering = 1, encoding = "utf-8")
-            job = WriteFileJob(writer, self._stream, nodes, MeshWriter.OutputMode.TextMode)
+            if preferred_format["mode"] == FileWriter.OutputMode.TextMode:
+                self._stream = open(file_name, "wt", buffering = 1, encoding = "utf-8")
+            else: #Binary mode.
+                self._stream = open(file_name, "wb", buffering = 1)
+            job = WriteFileJob(writer, self._stream, nodes, preferred_format["mode"])
             job.setFileName(file_name)
             job.progress.connect(self._onProgress)
             job.finished.connect(self._onFinished)
@@ -101,14 +108,14 @@ class RemovableDriveOutputDevice(OutputDevice):
             Logger.log("e", "Operating system would not let us write to %s: %s", file_name, str(e))
             raise OutputDeviceError.WriteRequestFailedError(catalog.i18nc("@info:status Don't translate the XML tags <filename> or <message>!", "Could not save to <filename>{0}</filename>: <message>{1}</message>").format(file_name, str(e))) from e
 
-    ##  Generate a file name automatically for the specified nodes to be saved
-    #   in.
-    #
-    #   The name generated will be the name of one of the nodes. Which node that
-    #   is can not be guaranteed.
-    #
-    #   \param nodes A collection of nodes for which to generate a file name.
     def _automaticFileName(self, nodes):
+        """Generate a file name automatically for the specified nodes to be saved in.
+
+        The name generated will be the name of one of the nodes. Which node that
+        is can not be guaranteed.
+
+        :param nodes: A collection of nodes for which to generate a file name.
+        """
         for root in nodes:
             for child in BreadthFirstIterator(root):
                 if child.getMeshData():

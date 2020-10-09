@@ -7,53 +7,49 @@ from UM.Mesh.MeshBuilder import MeshBuilder
 from .LayerData import LayerData
 
 import numpy
+from typing import Dict, Optional
 
 
-## Builder class for constructing a LayerData object
 class LayerDataBuilder(MeshBuilder):
-    def __init__(self):
-        super().__init__()
-        self._layers = {}
-        self._element_counts = {}
+    """Builder class for constructing a :py:class:`cura.LayerData.LayerData` object"""
 
-    def addLayer(self, layer):
+    def __init__(self) -> None:
+        super().__init__()
+        self._layers = {}  # type: Dict[int, Layer]
+        self._element_counts = {}  # type: Dict[int, int]
+
+    def addLayer(self, layer: int) -> None:
         if layer not in self._layers:
             self._layers[layer] = Layer(layer)
 
-    def addPolygon(self, layer, polygon_type, data, line_width):
-        if layer not in self._layers:
-            self.addLayer(layer)
+    def getLayer(self, layer: int) -> Optional[Layer]:
+        return self._layers.get(layer)
 
-        p = LayerPolygon(self, polygon_type, data, line_width)
-        self._layers[layer].polygons.append(p)
-
-    def getLayer(self, layer):
-        if layer in self._layers:
-            return self._layers[layer]
-
-    def getLayers(self):
+    def getLayers(self) -> Dict[int, Layer]:
         return self._layers
 
-    def getElementCounts(self):
+    def getElementCounts(self) -> Dict[int, int]:
         return self._element_counts
 
-    def setLayerHeight(self, layer, height):
+    def setLayerHeight(self, layer: int, height: float) -> None:
         if layer not in self._layers:
             self.addLayer(layer)
 
         self._layers[layer].setHeight(height)
 
-    def setLayerThickness(self, layer, thickness):
+    def setLayerThickness(self, layer: int, thickness: float) -> None:
         if layer not in self._layers:
             self.addLayer(layer)
 
         self._layers[layer].setThickness(thickness)
 
-    ##  Return the layer data as LayerData.
-    #
-    #   \param material_color_map: [r, g, b, a] for each extruder row.
-    #   \param line_type_brightness: compatibility layer view uses line type brightness of 0.5
     def build(self, material_color_map, line_type_brightness = 1.0):
+        """Return the layer data as :py:class:`cura.LayerData.LayerData`.
+
+        :param material_color_map: [r, g, b, a] for each extruder row.
+        :param line_type_brightness: compatibility layer view uses line type brightness of 0.5
+        """
+
         vertex_count = 0
         index_count = 0
         for layer, data in self._layers.items():
@@ -64,13 +60,14 @@ class LayerDataBuilder(MeshBuilder):
         line_dimensions = numpy.empty((vertex_count, 2), numpy.float32)
         colors = numpy.empty((vertex_count, 4), numpy.float32)
         indices = numpy.empty((index_count, 2), numpy.int32)
+        feedrates = numpy.empty((vertex_count), numpy.float32)
         extruders = numpy.empty((vertex_count), numpy.float32)
         line_types = numpy.empty((vertex_count), numpy.float32)
 
         vertex_offset = 0
         index_offset = 0
         for layer, data in sorted(self._layers.items()):
-            ( vertex_offset, index_offset ) = data.build( vertex_offset, index_offset, vertices, colors, line_dimensions, extruders, line_types, indices)
+            vertex_offset, index_offset = data.build(vertex_offset, index_offset, vertices, colors, line_dimensions, feedrates, extruders, line_types, indices)
             self._element_counts[layer] = data.elementCount
 
         self.addVertices(vertices)
@@ -106,6 +103,11 @@ class LayerDataBuilder(MeshBuilder):
             "line_types": {
                 "value": line_types,
                 "opengl_name": "a_line_type",
+                "opengl_type": "float"
+                },
+            "feedrates": {
+                "value": feedrates,
+                "opengl_name": "a_feedrate",
                 "opengl_type": "float"
                 }
             }

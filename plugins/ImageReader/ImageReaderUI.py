@@ -1,11 +1,10 @@
-# Copyright (c) 2015 Ultimaker B.V.
+# Copyright (c) 2020 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
 import os
 import threading
 
-from PyQt5.QtCore import Qt, QUrl, pyqtSignal, QObject
-from PyQt5.QtQml import QQmlComponent, QQmlContext
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
 from UM.FlameProfiler import pyqtSlot
 from UM.Application import Application
 from UM.PluginRegistry import PluginRegistry
@@ -31,10 +30,12 @@ class ImageReaderUI(QObject):
         self._width = self.default_width
         self._depth = self.default_depth
 
-        self.base_height = 1
-        self.peak_height = 10
+        self.base_height = 0.4
+        self.peak_height = 2.5
         self.smoothing = 1
-        self.image_color_invert = False;
+        self.lighter_is_higher = False
+        self.use_transparency_model = True
+        self.transmittance_1mm = 50.0  # based on pearl PLA
 
         self._ui_lock = threading.Lock()
         self._cancelled = False
@@ -76,38 +77,45 @@ class ImageReaderUI(QObject):
 
         self._ui_view.findChild(QObject, "Base_Height").setProperty("text", str(self.base_height))
         self._ui_view.findChild(QObject, "Peak_Height").setProperty("text", str(self.peak_height))
+        self._ui_view.findChild(QObject, "Transmittance").setProperty("text", str(self.transmittance_1mm))
         self._ui_view.findChild(QObject, "Smoothing").setProperty("value", self.smoothing)
 
     def _createConfigUI(self):
         if self._ui_view is None:
             Logger.log("d", "Creating ImageReader config UI")
-            path = QUrl.fromLocalFile(os.path.join(PluginRegistry.getInstance().getPluginPath("ImageReader"), "ConfigUI.qml"))
-            component = QQmlComponent(Application.getInstance()._engine, path)
-            self._ui_context = QQmlContext(Application.getInstance()._engine.rootContext())
-            self._ui_context.setContextProperty("manager", self)
-            self._ui_view = component.create(self._ui_context)
-
-            self._ui_view.setFlags(self._ui_view.flags() & ~Qt.WindowCloseButtonHint & ~Qt.WindowMinimizeButtonHint & ~Qt.WindowMaximizeButtonHint);
-
+            path = os.path.join(PluginRegistry.getInstance().getPluginPath("ImageReader"), "ConfigUI.qml")
+            self._ui_view = Application.getInstance().createQmlComponent(path, {"manager": self})
+            self._ui_view.setFlags(self._ui_view.flags() & ~Qt.WindowCloseButtonHint & ~Qt.WindowMinimizeButtonHint & ~Qt.WindowMaximizeButtonHint)
             self._disable_size_callbacks = False
 
     @pyqtSlot()
     def onOkButtonClicked(self):
         self._cancelled = False
         self._ui_view.close()
-        self._ui_lock.release()
+        try:
+            self._ui_lock.release()
+        except RuntimeError:
+            # We don't really care if it was held or not. Just make sure it's not held now
+            pass
 
     @pyqtSlot()
     def onCancelButtonClicked(self):
         self._cancelled = True
         self._ui_view.close()
-        self._ui_lock.release()
+        try:
+            self._ui_lock.release()
+        except RuntimeError:
+            # We don't really care if it was held or not. Just make sure it's not held now
+            pass
 
     @pyqtSlot(str)
     def onWidthChanged(self, value):
         if self._ui_view and not self._disable_size_callbacks:
             if len(value) > 0:
-                self._width = float(value)
+                try:
+                    self._width = float(value.replace(",", "."))
+                except ValueError:  # Can happen with incomplete numbers, such as "-".
+                    self._width = 0
             else:
                 self._width = 0
 
@@ -120,7 +128,10 @@ class ImageReaderUI(QObject):
     def onDepthChanged(self, value):
         if self._ui_view and not self._disable_size_callbacks:
             if len(value) > 0:
-                self._depth = float(value)
+                try:
+                    self._depth = float(value.replace(",", "."))
+                except ValueError:  # Can happen with incomplete numbers, such as "-".
+                    self._depth = 0
             else:
                 self._depth = 0
 
@@ -131,15 +142,23 @@ class ImageReaderUI(QObject):
 
     @pyqtSlot(str)
     def onBaseHeightChanged(self, value):
-        if (len(value) > 0):
-            self.base_height = float(value)
+        if len(value) > 0:
+            try:
+                self.base_height = float(value.replace(",", "."))
+            except ValueError:  # Can happen with incomplete numbers, such as "-".
+                self.base_height = 0
         else:
             self.base_height = 0
 
     @pyqtSlot(str)
     def onPeakHeightChanged(self, value):
-        if (len(value) > 0):
-            self.peak_height = float(value)
+        if len(value) > 0:
+            try:
+                self.peak_height = float(value.replace(",", "."))
+                if self.peak_height < 0:
+                    self.peak_height = 2.5
+            except ValueError:  # Can happen with incomplete numbers, such as "-".
+                self.peak_height = 2.5  # restore default
         else:
             self.peak_height = 0
 
@@ -149,7 +168,12 @@ class ImageReaderUI(QObject):
 
     @pyqtSlot(int)
     def onImageColorInvertChanged(self, value):
-        if (value == 1):
-            self.image_color_invert = True
-        else:
-            self.image_color_invert = False
+        self.lighter_is_higher = (value == 1)
+
+    @pyqtSlot(int)
+    def onColorModelChanged(self, value):
+        self.use_transparency_model = (value == 1)
+
+    @pyqtSlot(int)
+    def onTransmittanceChanged(self, value):
+        self.transmittance_1mm = value

@@ -7,6 +7,8 @@ import QtQuick.Controls 1.1
 import UM 1.3 as UM
 import Cura 1.0 as Cura
 
+import "../Dialogs"
+
 Menu
 {
     id: menu
@@ -22,47 +24,13 @@ Menu
         {
             text:
             {
-                var path = modelData.toString()
+                var path = decodeURIComponent(modelData.toString())
                 return (index + 1) + ". " + path.slice(path.lastIndexOf("/") + 1);
             }
             onTriggered:
             {
-                var toShowDialog = false;
-                var toOpenAsProject = false;
-                var toOpenAsModel = false;
+                CuraApplication.readLocalFile(modelData);
 
-                if (CuraApplication.checkIsValidProjectFile(modelData)) {
-                    // check preference
-                    var choice = UM.Preferences.getValue("cura/choice_on_open_project");
-
-                    if (choice == "open_as_project")
-                    {
-                        toOpenAsProject = true;
-                    }else if (choice == "open_as_model"){
-                        toOpenAsModel = true;
-                    }else{
-                        toShowDialog = true;
-                    }
-                }
-                else {
-                    toOpenAsModel = true;
-                }
-
-                if (toShowDialog) {
-                    askOpenAsProjectOrModelsDialog.fileUrl = modelData;
-                    askOpenAsProjectOrModelsDialog.show();
-                    return;
-                }
-
-                // open file in the prefered way
-                if (toOpenAsProject)
-                {
-                    UM.WorkspaceFileHandler.readLocalFile(modelData);
-                }
-                else if (toOpenAsModel)
-                {
-                    CuraApplication.readLocalFile(modelData);
-                }
                 var meshName = backgroundItem.getMeshName(modelData.toString())
                 backgroundItem.hasMesh(decodeURIComponent(meshName))
             }

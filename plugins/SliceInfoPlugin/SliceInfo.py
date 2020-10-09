@@ -1,79 +1,141 @@
-# Copyright (c) 2015 Ultimaker B.V.
+# Copyright (c) 2018 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
-from cura.CuraApplication import CuraApplication
-from cura.Settings.ExtruderManager import ExtruderManager
+import json
+import os
+import platform
+import time
+from typing import cast, Optional, Set, TYPE_CHECKING
+
+from PyQt5.QtCore import pyqtSlot, QObject
+from PyQt5.QtNetwork import QNetworkRequest
 
 from UM.Extension import Extension
-from UM.Application import Application
-from UM.Preferences import Preferences
 from UM.Scene.Iterator.DepthFirstIterator import DepthFirstIterator
-from UM.Message import Message
 from UM.i18n import i18nCatalog
 from UM.Logger import Logger
-
-import time
-
+from UM.PluginRegistry import PluginRegistry
 from UM.Qt.Duration import DurationFormat
 
-from .SliceInfoJob import SliceInfoJob
+from cura import ApplicationMetadata
 
-import platform
-import math
-import urllib.request
-import urllib.parse
-import json
+if TYPE_CHECKING:
+    from PyQt5.QtNetwork import QNetworkReply
+
 
 catalog = i18nCatalog("cura")
 
 
-##      This Extension runs in the background and sends several bits of information to the Ultimaker servers.
-#       The data is only sent when the user in question gave permission to do so. All data is anonymous and
-#       no model files are being sent (Just a SHA256 hash of the model).
-class SliceInfo(Extension):
+class SliceInfo(QObject, Extension):
+    """This Extension runs in the background and sends several bits of information to the Ultimaker servers.
+
+    The data is only sent when the user in question gave permission to do so. All data is anonymous and
+    no model files are being sent (Just a SHA256 hash of the model).
+    """
+
     info_url = "https://stats.ultimaker.com/api/cura"
 
-    def __init__(self):
-        super().__init__()
-        Application.getInstance().getOutputDeviceManager().writeStarted.connect(self._onWriteStarted)
-        Preferences.getInstance().addPreference("info/send_slice_info", True)
-        Preferences.getInstance().addPreference("info/asked_send_slice_info", False)
+    def __init__(self, parent = None):
+        QObject.__init__(self, parent)
+        Extension.__init__(self)
 
-        if not Preferences.getInstance().getValue("info/asked_send_slice_info"):
-            self.send_slice_info_message = Message(catalog.i18nc("@info", "Cura collects anonymised slicing statistics. You can disable this in the preferences."),
-                                                   lifetime = 0,
-                                                   dismissable = False,
-                                                   title = catalog.i18nc("@info:title", "Collecting Data"))
+        from cura.CuraApplication import CuraApplication
+        self._application = CuraApplication.getInstance()
 
-            self.send_slice_info_message.addAction("Dismiss", catalog.i18nc("@action:button", "Dismiss"), None, "")
-            self.send_slice_info_message.actionTriggered.connect(self.messageActionTriggered)
-            self.send_slice_info_message.show()
+        self._application.getOutputDeviceManager().writeStarted.connect(self._onWriteStarted)
+        self._application.getPreferences().addPreference("info/send_slice_info", True)
+        self._application.getPreferences().addPreference("info/asked_send_slice_info", False)
+
+        self._more_info_dialog = None
+        self._example_data_content = None
+
+        self._application.initializationFinished.connect(self._onAppInitialized)
+
+    def _onAppInitialized(self):
+        # DO NOT read any preferences values in the constructor because at the time plugins are created, no version
+        # upgrade has been performed yet because version upgrades are plugins too!
+        if self._more_info_dialog is None:
+            self._more_info_dialog = self._createDialog("MoreInfoWindow.qml")
 
     def messageActionTriggered(self, message_id, action_id):
+        """Perform action based on user input.
+
+        Note that clicking "Disable" won't actually disable the data sending, but rather take the user to preferences where they can disable it.
+        """
+        self._application.getPreferences().setValue("info/asked_send_slice_info", True)
+        if action_id == "MoreInfo":
+            self.showMoreInfoDialog()
         self.send_slice_info_message.hide()
-        Preferences.getInstance().setValue("info/asked_send_slice_info", True)
+
+    def showMoreInfoDialog(self):
+        if self._more_info_dialog is None:
+            self._more_info_dialog = self._createDialog("MoreInfoWindow.qml")
+        self._more_info_dialog.show()
+
+    def _createDialog(self, qml_name):
+        Logger.log("d", "Creating dialog [%s]", qml_name)
+        file_path = os.path.join(PluginRegistry.getInstance().getPluginPath(self.getPluginId()), qml_name)
+        dialog = self._application.createQmlComponent(file_path, {"manager": self})
+        return dialog
+
+    @pyqtSlot(result = str)
+    def getExampleData(self) -> Optional[str]:
+        if self._example_data_content is None:
+            plugin_path = PluginRegistry.getInstance().getPluginPath(self.getPluginId())
+            if not plugin_path:
+                Logger.log("e", "Could not get plugin path!", self.getPluginId())
+                return None
+            file_path = os.path.join(plugin_path, "example_data.html")
+            if file_path:
+                with open(file_path, "r", encoding = "utf-8") as f:
+                    self._example_data_content = f.read()
+        return self._example_data_content
+
+    @pyqtSlot(bool)
+    def setSendSliceInfo(self, enabled: bool):
+        self._application.getPreferences().setValue("info/send_slice_info", enabled)
+
+    def _getUserModifiedSettingKeys(self) -> list:
+        machine_manager = self._application.getMachineManager()
+        global_stack = machine_manager.activeMachine
+
+        user_modified_setting_keys = set()  # type: Set[str]
+
+        for stack in [global_stack] + global_stack.extruderList:
+            # Get all settings in user_changes and quality_changes
+            all_keys = stack.userChanges.getAllKeys() | stack.qualityChanges.getAllKeys()
+            user_modified_setting_keys |= all_keys
+
+        return list(sorted(user_modified_setting_keys))
 
     def _onWriteStarted(self, output_device):
         try:
-            if not Preferences.getInstance().getValue("info/send_slice_info"):
+            if not self._application.getPreferences().getValue("info/send_slice_info"):
                 Logger.log("d", "'info/send_slice_info' is turned off.")
                 return  # Do nothing, user does not want to send data
 
-            global_container_stack = Application.getInstance().getGlobalContainerStack()
-            print_information = Application.getInstance().getPrintInformation()
+            machine_manager = self._application.getMachineManager()
+            print_information = self._application.getPrintInformation()
+
+            global_stack = machine_manager.activeMachine
 
             data = dict()  # The data that we're going to submit.
             data["time_stamp"] = time.time()
             data["schema_version"] = 0
-            data["cura_version"] = Application.getInstance().getVersion()
+            data["cura_version"] = self._application.getVersion()
+            data["cura_build_type"] = ApplicationMetadata.CuraBuildType
 
-            active_mode = Preferences.getInstance().getValue("cura/active_mode")
+            active_mode = self._application.getPreferences().getValue("cura/active_mode")
             if active_mode == 0:
                 data["active_mode"] = "recommended"
             else:
                 data["active_mode"] = "custom"
 
-            definition_changes = global_container_stack.definitionChanges
+            data["camera_view"] = self._application.getPreferences().getValue("general/camera_perspective_mode")
+            if data["camera_view"] == "orthographic":
+                data["camera_view"] = "orthogonal" #The database still only recognises the old name "orthogonal".
+
+            definition_changes = global_stack.definitionChanges
             machine_settings_changed_by_user = False
             if definition_changes.getId() != "empty":
                 # Now a definition_changes container will always be created for a stack,
@@ -82,29 +144,27 @@ class SliceInfo(Extension):
                     machine_settings_changed_by_user = True
 
             data["machine_settings_changed_by_user"] = machine_settings_changed_by_user
-            data["language"] = Preferences.getInstance().getValue("general/language")
+            data["language"] = self._application.getPreferences().getValue("general/language")
             data["os"] = {"type": platform.system(), "version": platform.version()}
 
-            data["active_machine"] = {"definition_id": global_container_stack.definition.getId(), "manufacturer": global_container_stack.definition.getMetaData().get("manufacturer","")}
+            data["active_machine"] = {"definition_id": global_stack.definition.getId(),
+                                      "manufacturer": global_stack.definition.getMetaDataEntry("manufacturer", "")}
 
+            # add extruder specific data to slice info
             data["extruders"] = []
-            extruder_count = len(global_container_stack.extruders)
-            extruders = []
-            if extruder_count > 1:
-                extruders = list(ExtruderManager.getInstance().getMachineExtruders(global_container_stack.getId()))
-                extruders = sorted(extruders, key = lambda extruder: extruder.getMetaDataEntry("position"))
-
-            if not extruders:
-                extruders = [global_container_stack]
+            extruders = global_stack.extruderList
+            extruders = sorted(extruders, key = lambda extruder: extruder.getMetaDataEntry("position"))
 
             for extruder in extruders:
                 extruder_dict = dict()
-                extruder_dict["active"] = ExtruderManager.getInstance().getActiveExtruderStack() == extruder
+                extruder_dict["active"] = machine_manager.activeStack == extruder
                 extruder_dict["material"] = {"GUID": extruder.material.getMetaData().get("GUID", ""),
                                              "type": extruder.material.getMetaData().get("material", ""),
                                              "brand": extruder.material.getMetaData().get("brand", "")
                                              }
-                extruder_dict["material_used"] = print_information.materialLengths[int(extruder.getMetaDataEntry("position", "0"))]
+                extruder_position = int(extruder.getMetaDataEntry("position", "0"))
+                if len(print_information.materialLengths) > extruder_position:
+                    extruder_dict["material_used"] = print_information.materialLengths[extruder_position]
                 extruder_dict["variant"] = extruder.variant.getName()
                 extruder_dict["nozzle_size"] = extruder.getProperty("machine_nozzle_size", "value")
 
@@ -119,22 +179,27 @@ class SliceInfo(Extension):
                 extruder_dict["extruder_settings"] = extruder_settings
                 data["extruders"].append(extruder_dict)
 
-            data["quality_profile"] = global_container_stack.quality.getMetaData().get("quality_type")
+            data["intent_category"] = global_stack.getIntentCategory()
+            data["quality_profile"] = global_stack.quality.getMetaData().get("quality_type")
+
+            data["user_modified_setting_keys"] = self._getUserModifiedSettingKeys()
 
             data["models"] = []
             # Listing all files placed on the build plate
-            for node in DepthFirstIterator(CuraApplication.getInstance().getController().getScene().getRoot()):
+            for node in DepthFirstIterator(self._application.getController().getScene().getRoot()):
                 if node.callDecoration("isSliceable"):
                     model = dict()
                     model["hash"] = node.getMeshData().getHash()
                     bounding_box = node.getBoundingBox()
+                    if not bounding_box:
+                        continue
                     model["bounding_box"] = {"minimum": {"x": bounding_box.minimum.x,
                                                          "y": bounding_box.minimum.y,
                                                          "z": bounding_box.minimum.z},
                                              "maximum": {"x": bounding_box.maximum.x,
                                                          "y": bounding_box.maximum.y,
                                                          "z": bounding_box.maximum.z}}
-                    model["transformation"] = {"data": str(node.getWorldTransformation().getData()).replace("\n", "")}
+                    model["transformation"] = {"data": str(node.getWorldTransformation(copy = False).getData()).replace("\n", "")}
                     extruder_position = node.callDecoration("getActiveExtruderPosition")
                     model["extruder"] = 0 if extruder_position is None else int(extruder_position)
 
@@ -142,7 +207,7 @@ class SliceInfo(Extension):
                     model_stack = node.callDecoration("getStack")
                     if model_stack:
                         model_settings["support_enabled"] = model_stack.getProperty("support_enable", "value")
-                        model_settings["support_extruder_nr"] = int(model_stack.getProperty("support_extruder_nr", "value"))
+                        model_settings["support_extruder_nr"] = int(model_stack.getExtruderPositionValueWithDefault("support_extruder_nr"))
 
                         # Mesh modifiers;
                         model_settings["infill_mesh"] = model_stack.getProperty("infill_mesh", "value")
@@ -162,35 +227,35 @@ class SliceInfo(Extension):
 
                     data["models"].append(model)
 
-            print_times = print_information._print_time_message_values
+            print_times = print_information.printTimes()
             data["print_times"] = {"travel": int(print_times["travel"].getDisplayString(DurationFormat.Format.Seconds)),
                                    "support": int(print_times["support"].getDisplayString(DurationFormat.Format.Seconds)),
                                    "infill": int(print_times["infill"].getDisplayString(DurationFormat.Format.Seconds)),
                                    "total": int(print_information.currentPrintTime.getDisplayString(DurationFormat.Format.Seconds))}
 
             print_settings = dict()
-            print_settings["layer_height"] = global_container_stack.getProperty("layer_height", "value")
+            print_settings["layer_height"] = global_stack.getProperty("layer_height", "value")
 
             # Support settings
-            print_settings["support_enabled"] = global_container_stack.getProperty("support_enable", "value")
-            print_settings["support_extruder_nr"] = int(global_container_stack.getProperty("support_extruder_nr", "value"))
+            print_settings["support_enabled"] = global_stack.getProperty("support_enable", "value")
+            print_settings["support_extruder_nr"] = int(global_stack.getExtruderPositionValueWithDefault("support_extruder_nr"))
 
             # Platform adhesion settings
-            print_settings["adhesion_type"] = global_container_stack.getProperty("adhesion_type", "value")
+            print_settings["adhesion_type"] = global_stack.getProperty("adhesion_type", "value")
 
             # Shell settings
-            print_settings["wall_line_count"] = global_container_stack.getProperty("wall_line_count", "value")
-            print_settings["retraction_enable"] = global_container_stack.getProperty("retraction_enable", "value")
+            print_settings["wall_line_count"] = global_stack.getProperty("wall_line_count", "value")
+            print_settings["retraction_enable"] = global_stack.getProperty("retraction_enable", "value")
 
             # Prime tower settings
-            print_settings["prime_tower_enable"] = global_container_stack.getProperty("prime_tower_enable", "value")
+            print_settings["prime_tower_enable"] = global_stack.getProperty("prime_tower_enable", "value")
 
             # Infill settings
-            print_settings["infill_sparse_density"] = global_container_stack.getProperty("infill_sparse_density", "value")
-            print_settings["infill_pattern"] = global_container_stack.getProperty("infill_pattern", "value")
-            print_settings["gradual_infill_steps"] = global_container_stack.getProperty("gradual_infill_steps", "value")
+            print_settings["infill_sparse_density"] = global_stack.getProperty("infill_sparse_density", "value")
+            print_settings["infill_pattern"] = global_stack.getProperty("infill_pattern", "value")
+            print_settings["gradual_infill_steps"] = global_stack.getProperty("gradual_infill_steps", "value")
 
-            print_settings["print_sequence"] = global_container_stack.getProperty("print_sequence", "value")
+            print_settings["print_sequence"] = global_stack.getProperty("print_sequence", "value")
 
             data["print_settings"] = print_settings
 
@@ -200,10 +265,23 @@ class SliceInfo(Extension):
             # Convert data to bytes
             binary_data = json.dumps(data).encode("utf-8")
 
-            # Sending slice info non-blocking
-            reportJob = SliceInfoJob(self.info_url, binary_data)
-            reportJob.start()
+            # Send slice info non-blocking
+            network_manager = self._application.getHttpRequestManager()
+            network_manager.post(self.info_url, data = binary_data,
+                                 callback = self._onRequestFinished, error_callback = self._onRequestError)
         except Exception:
             # We really can't afford to have a mistake here, as this would break the sending of g-code to a device
             # (Either saving or directly to a printer). The functionality of the slice data is not *that* important.
             Logger.logException("e", "Exception raised while sending slice info.") # But we should be notified about these problems of course.
+
+    def _onRequestFinished(self, reply: "QNetworkReply") -> None:
+        status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        if status_code == 200:
+            Logger.log("i", "SliceInfo sent successfully")
+            return
+
+        data = reply.readAll().data().decode("utf-8")
+        Logger.log("e", "SliceInfo request failed, status code %s, data: %s", status_code, data)
+
+    def _onRequestError(self, reply: "QNetworkReply", error: "QNetworkReply.NetworkError") -> None:
+        Logger.log("e", "Got error for SliceInfo request: %s", reply.errorString())

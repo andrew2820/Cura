@@ -1,86 +1,128 @@
-# Copyright (c) 2017 Ultimaker B.V.
+# Copyright (c) 2020 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
-from UM.Preferences import Preferences
 from UM.Application import Application
 from UM.Message import Message
 from UM.Logger import Logger
 from UM.Job import Job
+from UM.Version import Version
 
 import urllib.request
-import codecs
+from urllib.error import URLError
+from typing import Dict
+import ssl
 
-from PyQt5.QtCore import QUrl
-from PyQt5.QtGui import QDesktopServices
+import certifi
+
+from .FirmwareUpdateCheckerLookup import FirmwareUpdateCheckerLookup, getSettingsKeyForMachine
+from .FirmwareUpdateCheckerMessage import FirmwareUpdateCheckerMessage
 
 from UM.i18n import i18nCatalog
 i18n_catalog = i18nCatalog("cura")
 
 
-##  This job checks if there is an update available on the provided URL.
 class FirmwareUpdateCheckerJob(Job):
-    def __init__(self, container = None, silent = False, url = None):
+    """This job checks if there is an update available on the provided URL."""
+
+    STRING_ZERO_VERSION = "0.0.0"
+    STRING_EPSILON_VERSION = "0.0.1"
+    ZERO_VERSION = Version(STRING_ZERO_VERSION)
+    EPSILON_VERSION = Version(STRING_EPSILON_VERSION)
+
+    def __init__(self, silent, machine_name, metadata, callback) -> None:
         super().__init__()
-        self._container = container
         self.silent = silent
-        self._url = url
-        self._download_url = None  # If an update was found, the download_url will be set to the location of the new version.
+        self._callback = callback
 
-    ##  Callback for the message that is spawned when there is a new version.
-    def actionTriggered(self, message, action):
-        if action == "download":
-            if self._download_url is not None:
-                QDesktopServices.openUrl(QUrl(self._download_url))
+        self._machine_name = machine_name
+        self._metadata = metadata
+        self._lookups = FirmwareUpdateCheckerLookup(self._machine_name, self._metadata)
+        self._headers = {}  # type:Dict[str, str]  # Don't set headers yet.
 
-    def run(self):
-        self._download_url = None  # Reset download ur.
-        if not self._url:
-            Logger.log("e", "Can not check for a new release. URL not set!")
-            return
+    def getUrlResponse(self, url: str) -> str:
+        result = self.STRING_ZERO_VERSION
 
         try:
-            application_name = Application.getInstance().getApplicationName()
-            headers = {"User-Agent": "%s - %s" % (application_name, Application.getInstance().getVersion())}
-            request = urllib.request.Request(self._url, headers = headers)
-            current_version_file = urllib.request.urlopen(request)
-            reader = codecs.getreader("utf-8")
+            # CURA-6698 Create an SSL context and use certifi CA certificates for verification.
+            context = ssl.SSLContext(protocol = ssl.PROTOCOL_TLSv1_2)
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile = certifi.where())
 
-            # get machine name from the definition container
-            machine_name = self._container.definition.getName()
-            machine_name_parts = machine_name.lower().split(" ")
+            request = urllib.request.Request(url, headers = self._headers)
+            response = urllib.request.urlopen(request, context = context)
+            result = response.read().decode("utf-8")
+        except URLError:
+            Logger.log("w", "Could not reach '{0}', if this URL is old, consider removal.".format(url))
+        return result
+
+    def parseVersionResponse(self, response: str) -> Version:
+        raw_str = response.split("\n", 1)[0].rstrip()
+        return Version(raw_str)
+
+    def getCurrentVersion(self) -> Version:
+        max_version = self.ZERO_VERSION
+        if self._lookups is None:
+            return max_version
+
+        machine_urls = self._lookups.getCheckUrls()
+        if machine_urls is not None:
+            for url in machine_urls:
+                version = self.parseVersionResponse(self.getUrlResponse(url))
+                if version > max_version:
+                    max_version = version
+
+        if max_version < self.EPSILON_VERSION:
+            Logger.log("w", "MachineID {0} not handled!".format(self._lookups.getMachineName()))
+
+        return max_version
+
+    def run(self):
+        try:
+            # Initialize a Preference that stores the last version checked for this printer.
+            Application.getInstance().getPreferences().addPreference(
+                getSettingsKeyForMachine(self._lookups.getMachineId()), "")
+
+            # Get headers
+            application_name = Application.getInstance().getApplicationName()
+            application_version = Application.getInstance().getVersion()
+            self._headers = {"User-Agent": "%s - %s" % (application_name, application_version)}
 
             # If it is not None, then we compare between the checked_version and the current_version
-            # Now we just do that if the active printer is Ultimaker 3 or Ultimaker 3 Extended or any
-            # other Ultimaker 3 that will come in the future
-            if len(machine_name_parts) >= 2 and machine_name_parts[:2] == ["ultimaker", "3"]:
-                # Nothing to parse, just get the string
-                # TODO: In the future may be done by parsing a JSON file with diferent version for each printer model
-                current_version = reader(current_version_file).readline().rstrip()
+            machine_id = self._lookups.getMachineId()
+            if machine_id is not None:
+                Logger.log("i", "You have a(n) {0} in the printer list. Do firmware-check.".format(self._machine_name))
 
-                # If it is the first time the version is checked, the checked_version is ''
-                checked_version = Preferences.getInstance().getValue("info/latest_checked_firmware")
+                current_version = self.getCurrentVersion()
 
-                # If the checked_version is '', it's because is the first time we check firmware and in this case
+                # This case indicates that was an error checking the version.
+                # It happens for instance when not connected to internet.
+                if current_version == self.ZERO_VERSION:
+                    return
+
+                # If it is the first time the version is checked, the checked_version is ""
+                setting_key_str = getSettingsKeyForMachine(machine_id)
+                checked_version = Version(Application.getInstance().getPreferences().getValue(setting_key_str))
+
+                # If the checked_version is "", it's because is the first time we check firmware and in this case
                 # we will not show the notification, but we will store it for the next time
-                Preferences.getInstance().setValue("info/latest_checked_firmware", current_version)
-                Logger.log("i", "Reading firmware version of %s: checked = %s - latest = %s", machine_name, checked_version, current_version)
+                Application.getInstance().getPreferences().setValue(setting_key_str, current_version)
+                Logger.log("i", "Reading firmware version of %s: checked = %s - latest = %s",
+                           self._machine_name, checked_version, current_version)
 
                 # The first time we want to store the current version, the notification will not be shown,
                 # because the new version of Cura will be release before the firmware and we don't want to
                 # notify the user when no new firmware version is available.
                 if (checked_version != "") and (checked_version != current_version):
-                    Logger.log("i", "SHOWING FIRMWARE UPDATE MESSAGE")
-                    message = Message(i18n_catalog.i18nc("@info Don't translate {machine_name}, since it gets replaced by a printer name!", "To ensure that your {machine_name} is equipped with the latest features it is recommended to update the firmware regularly. This can be done on the {machine_name} (when connected to the network) or via USB.").format(machine_name = machine_name),
-                                      title = i18n_catalog.i18nc("@info:title The %s gets replaced with the printer name.", "New %s firmware available") % machine_name)
-                    message.addAction("download", i18n_catalog.i18nc("@action:button", "Download"), "[no_icon]", "[no_description]")
-
-                    # If we do this in a cool way, the download url should be available in the JSON file
-                    self._download_url = "https://ultimaker.com/en/resources/20500-upgrade-firmware"
-                    message.actionTriggered.connect(self.actionTriggered)
+                    Logger.log("i", "Showing firmware update message for new version: {version}".format(version = current_version))
+                    message = FirmwareUpdateCheckerMessage(machine_id, self._machine_name, current_version,
+                                                           self._lookups.getRedirectUserUrl())
+                    message.actionTriggered.connect(self._callback)
                     message.show()
+            else:
+                Logger.log("i", "No machine with name {0} in list of firmware to check.".format(self._machine_name))
 
         except Exception as e:
-            Logger.log("w", "Failed to check for new version: %s", e)
+            Logger.logException("w", "Failed to check for new version: %s", e)
             if not self.silent:
                 Message(i18n_catalog.i18nc("@info", "Could not access update information.")).show()
             return

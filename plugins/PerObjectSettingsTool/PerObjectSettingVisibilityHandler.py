@@ -1,9 +1,11 @@
-# Copyright (c) 2016 Ultimaker B.V.
+# Copyright (c) 2020 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
-from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal
+from PyQt5.QtCore import pyqtProperty
+from UM.FlameProfiler import pyqtSlot
 
 from UM.Application import Application
+from UM.PluginRegistry import PluginRegistry
 from UM.Settings.ContainerRegistry import ContainerRegistry
 from UM.Settings.SettingInstance import SettingInstance
 from UM.Logger import Logger
@@ -12,15 +14,23 @@ import UM.Settings.Models.SettingVisibilityHandler
 from cura.Settings.ExtruderManager import ExtruderManager #To get global-inherits-stack setting values from different extruders.
 from cura.Settings.SettingOverrideDecorator import SettingOverrideDecorator
 
-##  The per object setting visibility handler ensures that only setting
-#   definitions that have a matching instance Container are returned as visible.
+
 class PerObjectSettingVisibilityHandler(UM.Settings.Models.SettingVisibilityHandler.SettingVisibilityHandler):
+    """The per object setting visibility handler ensures that only setting
+
+    definitions that have a matching instance Container are returned as visible.
+    """
     def __init__(self, parent = None, *args, **kwargs):
         super().__init__(parent = parent, *args, **kwargs)
 
         self._selected_object_id = None
         self._node = None
         self._stack = None
+
+        PluginRegistry.getInstance().getPluginObject("PerObjectSettingsTool").visibility_handler = self
+
+        # this is a set of settings that will be skipped if the user chooses to reset.
+        self._skip_reset_setting_set = set()
 
     def setSelectedObjectId(self, id):
         if id != self._selected_object_id:
@@ -36,6 +46,10 @@ class PerObjectSettingVisibilityHandler(UM.Settings.Models.SettingVisibilityHand
     def selectedObjectId(self):
         return self._selected_object_id
 
+    @pyqtSlot(str)
+    def addSkipResetSetting(self, setting_name):
+        self._skip_reset_setting_set.add(setting_name)
+
     def setVisible(self, visible):
         if not self._node:
             return
@@ -50,13 +64,16 @@ class PerObjectSettingVisibilityHandler(UM.Settings.Models.SettingVisibilityHand
 
         # Remove all instances that are not in visibility list
         for instance in all_instances:
+            # exceptionally skip setting
+            if instance.definition.key in self._skip_reset_setting_set:
+                continue
             if instance.definition.key not in visible:
                 settings.removeInstance(instance.definition.key)
                 visibility_changed = True
 
         # Add all instances that are not added, but are in visibility list
         for item in visible:
-            if not settings.getInstance(item): # Setting was not added already.
+            if settings.getInstance(item) is None:  # Setting was not added already.
                 definition = self._stack.getSettingDefinition(item)
                 if definition:
                     new_instance = SettingInstance(definition, settings)
